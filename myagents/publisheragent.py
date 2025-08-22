@@ -4,23 +4,18 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import logging
 import asyncio
 from typing import List
-# import httpx  # Commented out since we won't do HTTP requests
 from sqlalchemy import update, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-
 from myagents.db import async_session, NewsItem
 from myagents.taggeragent import run_tagger  
+from myagents.summarizeragent import run_summarizer  # import your summarizer
 
 logging.basicConfig(
     level=logging.ERROR,
     format='%(levelname)s: %(message)s'
 )
 logging.getLogger("sqlalchemy.engine").setLevel(logging.ERROR)
-# logging.getLogger("httpx").setLevel(logging.ERROR)  # No httpx calls, so comment this
-
-# FUNDEDFLOW_API_URL = os.getenv("FUNDEDFLOW_API_URL")
-# FUNDEDFLOW_API_KEY = os.getenv("FUNDEDFLOW_API_KEY")
 
 async def get_unpublished_news(session: AsyncSession, limit: int = 10) -> List[NewsItem]:
     stmt = select(NewsItem).where(
@@ -35,13 +30,13 @@ async def get_unpublished_news(session: AsyncSession, limit: int = 10) -> List[N
     return result.scalars().all()
 
 async def publish_to_fundedflow(item: NewsItem) -> bool:
-    # Since publishing is disabled, just pretend it's successful if URL valid
+    # Check URL
     if not item.url or not isinstance(item.url, str) or item.url.strip() == "" or item.url.strip().lower() == "none":
         logging.error(f"Skipping '{item.title}': missing or invalid URL.")
         return False
     
-    # Just log the item instead of sending it
-    print(f"Would publish: {item.title} | URL: {item.url}")
+    # Print title + summary (detailed)
+    print(f"Publishing: {item.title}\nSummary:\n{item.summary}\nKeywords: {', '.join(item.keywords if hasattr(item, 'keywords') else [])}\n")
     return True
 
 async def run_publisher(limit: int = 10) -> int:
@@ -53,6 +48,18 @@ async def run_publisher(limit: int = 10) -> int:
                 print("No unpublished news found.")
                 return 0
 
+            # Check for empty summaries and run summarizer if needed
+            for item in unpublished:
+                if not item.summary or item.summary.strip() == "":
+                    summarized_items = await run_summarizer([item])
+                    if summarized_items and len(summarized_items) > 0:
+                        item.summary = "\n".join(summarized_items[0].key_points)
+                        # Optionally, generate keywords using tagger agent
+                        item.keywords = await run_tagger(item.title + " " + item.summary)
+                        session.add(item)
+            await session.commit()
+
+            # Publish items
             for item in unpublished:
                 success = await publish_to_fundedflow(item)
                 if success:
@@ -74,16 +81,9 @@ async def run_publisher(limit: int = 10) -> int:
 
     return published_count
 
-
-# Wrapper function added here as requested
 async def run_publisher_wrapper(limit: int = 10) -> int:
-    """
-    Wrapper function for run_publisher.
-    Calls run_publisher and returns the published count.
-    """
     count = await run_publisher(limit=limit)
     return count
-
 
 if __name__ == "__main__":
     asyncio.run(run_publisher())

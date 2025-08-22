@@ -26,7 +26,8 @@ class NewsItem(Base):
     source: Mapped[str] = mapped_column(String(100), nullable=True)
     published_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     content: Mapped[str] = mapped_column(Text, nullable=True)
-    summary: Mapped[str] = mapped_column(Text, nullable=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=True)              # short key points
+    detailed_summary: Mapped[str] = mapped_column(Text, nullable=True)     # <-- new column for full narrative
     tags: Mapped[list[str]] = mapped_column(ARRAY(String), default=[])
     symbols: Mapped[list[str]] = mapped_column(ARRAY(String), default=[])
     url: Mapped[str] = mapped_column(String(500), unique=True, nullable=False)
@@ -70,6 +71,7 @@ async def save_feed_items_to_db(items: list[dict]):
                         published_at=parse_datetime(item.get('published_at')),
                         content=item.get('content'),
                         summary=item.get('summary'),
+                        detailed_summary=item.get('detailed_summary'),  # <-- save detailed summary here
                         tags=item.get('tags', []),
                         symbols=item.get('symbols', []),
                         url=url,

@@ -1,182 +1,175 @@
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-import json
 import asyncio
-import re
 from typing import List
-from dotenv import load_dotenv
-from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, declarative_base, mapped_column, Mapped
-from sqlalchemy import String, Integer, Text, DateTime, ARRAY, update, select
-from datetime import datetime
-from bs4 import BeautifulSoup
-from myagents.summarizeragent import run_summarizer
-# --- Load env and set API keys ---
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select, update
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from openai import AsyncOpenAI
+from agents import Agent, Runner, function_tool, set_tracing_disabled, OpenAIChatCompletionsModel
+from myagents.collectoragent import NewsItem
+
+# === ENV & DB setup ===
 load_dotenv()
+set_tracing_disabled(True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("❌ GEMINI_API_KEY is missing in .env")
 
-# --- DB Setup ---
-#DATABASE_URL = "postgresql+asyncpg://postgres:admin@localhost/newsfeed"
-import os
-from dotenv import load_dotenv
-
-load_dotenv()  # load .env in local dev, ignored in production on Render
-DATABASE_URL = os.environ["DATABASE_URL"]
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("❌ DATABASE_URL is missing in .env")
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-Base = declarative_base()
 
-class NewsItem(Base):
-    __tablename__ = "news_items"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    title: Mapped[str] = mapped_column(Text, nullable=False)
-    source: Mapped[str] = mapped_column(String(100), nullable=True)
-    published_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
-    content: Mapped[str] = mapped_column(Text, nullable=True)
-    summary: Mapped[str] = mapped_column(Text, nullable=True)
-    tags: Mapped[List[str]] = mapped_column(ARRAY(String), default=[])
-    symbols: Mapped[List[str]] = mapped_column(ARRAY(String), default=[])
-    url: Mapped[str] = mapped_column(String(500), unique=True, nullable=False)
-    provider: Mapped[str] = mapped_column(String(50), nullable=True)
-
-# --- OpenAI / Gemini Client Setup ---
+# === OpenAI client & model ===
 client = AsyncOpenAI(
     api_key=GEMINI_API_KEY,
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 
-# === Helper to clean HTML from summary ===
-def clean_html(text: str) -> str:
-    return BeautifulSoup(text or "", "html.parser").get_text(" ", strip=True)[:320]
+model = OpenAIChatCompletionsModel(
+    model="gemini-2.0-flash",
+    openai_client=client
+)
 
-# === Clean Gemini API response to extract JSON ===
-def clean_gemini_response(text: str) -> str:
-    pattern = r"```json\s*(\[\s*{.*}\s*\])\s*```"
-    match = re.search(pattern, text, re.DOTALL)
-    if match:
-        return match.group(1)
-    return text.strip().strip("```").strip()
+# === Pydantic model for structured tags ===
+class TaggedNewsItem(BaseModel):
+    symbols: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
 
-# === Tagger function that calls Gemini model and updates DB ===
-async def tag_news_items_and_update_db(items: List[NewsItem], db_session: AsyncSession) -> List[dict]:
-    news_list_str = "\n\n".join(
-        [f"{i+1}. Title: {item.title}\nSummary: {item.summary or ''}" for i, item in enumerate(items)]
-    )
-
-    prompt = f"""
-You are a financial tagging assistant.
-Respond ONLY with valid JSON — no explanations, no text outside JSON.
-
-For each news item below (title + summary):
-1. Extract any stock symbols (e.g., AAPL, TSLA, MSFT)
-2. Extract relevant tags such as: earnings, macro, fed, AI, tech, energy, crypto, etc.
-3. Output a JSON array where each element matches the order of the news items.
-
-Example:
-[
-  {{"symbols": ["AAPL"], "tags": ["earnings", "AI"]}},
-  {{"symbols": ["TSLA"], "tags": ["auto", "earnings"]}}
-]
-
-News items:
-{news_list_str}
-    """
-
-    resp = await client.chat.completions.create(
-        model="gemini-2.0-flash",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=800,
-        temperature=0
-    )
-
-    try:
-        raw_content = (
-            resp.choices[0].message["content"]
-            if isinstance(resp.choices[0].message, dict)
-            else resp.choices[0].message.content
-        )
-    except Exception:
-        return []
-
-    if not raw_content or not raw_content.strip():
-        return []
-
-    cleaned_content = clean_gemini_response(raw_content)
-
-    try:
-        tags_data = json.loads(cleaned_content)
-    except json.JSONDecodeError:
-        return []
-
-    results = []
-    for item, tags in zip(items, tags_data):
-        symbols = tags.get("symbols", [])
-        tags_list = tags.get("tags", [])
-
-        await db_session.execute(
-            update(NewsItem)
-            .where(NewsItem.id == item.id)
-            .values(symbols=symbols, tags=tags_list)
-        )
-
-        results.append({
-            "title": item.title,
-            "summary": item.summary,
-            "symbols": symbols,
-            "tags": tags_list,
-            "url": item.url,
-            "published_at": item.published_at.isoformat() if item.published_at else None
-        })
-
-    return results
+    @classmethod
+    def from_agent_text(cls, text: str) -> List["TaggedNewsItem"]:
+        """
+        Convert JSON text output from agent into list of TaggedNewsItem
+        """
+        import json
+        try:
+            data = json.loads(text)
+            return [cls(symbols=item.get("symbols", []), tags=item.get("tags", [])) for item in data]
+        except Exception:
+            return []
 
 # === Fetch untagged news from DB ===
-async def get_untagged_news(session: AsyncSession, limit: int = 10) -> List[NewsItem]:
-    stmt = select(NewsItem).where(
-        (NewsItem.tags == []) | (NewsItem.symbols == [])
-    ).limit(limit)
-    result = await session.execute(stmt)
-    return result.scalars().all()
-
-# === Main tagging loop ===
-async def main_tagger():
-    print("🔄 Starting tagging pipeline...")
+async def fetch_untagged_news(max_items: int = 10) -> List[NewsItem]:
     async with async_session() as session:
-        untagged = await get_untagged_news(session)
-        if not untagged:
-            print("No untagged news items found.")
-            print("🏁 Pipeline finished: 0 items tagged.")
-            return
-        tagged = await tag_news_items_and_update_db(untagged, session)
+        result = await session.execute(
+            select(NewsItem).where((NewsItem.tags == []) | (NewsItem.symbols == [])).limit(max_items)
+        )
+        return result.scalars().all()
+
+# === Tool: Tag news using OpenAI agent ===
+@function_tool
+async def tag_news_tool(news_text: str) -> List[TaggedNewsItem]:
+    """
+    Input: A string containing multiple news items, numbered.
+    Output: List of TaggedNewsItem with symbols and tags.
+    """
+    prompt = f"""
+You are a financial tagging assistant.
+Respond ONLY with valid JSON — no explanations.
+
+For each news item below (title + summary):
+1. Extract stock symbols (e.g., AAPL, TSLA, MSFT)
+2. Extract relevant tags such as: earnings, macro, fed, AI, tech, energy, crypto, etc.
+3. Output a JSON array in the same order of news items.
+
+News items:
+{news_text}
+"""
+    try:
+        resp = await client.chat.completions.create(
+            model="gemini-2.0-flash",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=800,
+            temperature=0
+        )
+        text = resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"❌ AI tagging failed: {e}")
+        return []
+
+    return TaggedNewsItem.from_agent_text(text)
+
+# === Tagger Agent ===
+tagger_agent = Agent(
+    name="NewsTagger",
+    instructions="""
+You generate structured tags for financial news.
+- Use `tag_news_tool` to extract symbols and relevant tags for each news item.
+- Output must be JSON, order should match the input.
+- Focus on accurate, relevant financial and market tags.
+""",
+    tools=[tag_news_tool],
+    model=model
+)
+
+# === Update DB with tags ===
+async def update_tags(items: List[NewsItem], tagged_items: List[TaggedNewsItem]):
+    async with async_session() as session:
+        for item_obj, tag_obj in zip(items, tagged_items):
+            session.add(
+                update(NewsItem)
+                .where(NewsItem.id == item_obj.id)
+                .values(symbols=tag_obj.symbols, tags=tag_obj.tags)
+            )
         await session.commit()
-        print(f"✅ Tagged {len(tagged)} news items.")
-        for item in tagged:
-            print(f"- {item['title']}")
-    print(f"🏁 Pipeline finished: {len(tagged)} items tagged.")
 
-# === Create tables ===
-async def create_tables():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-# === Run everything ===
+# === Main workflow ===
 async def main():
-    await create_tables()
-    await main_tagger()
+    items = await fetch_untagged_news(max_items=10)
+    if not items:
+        print("No untagged news to process.")
+        return
+
+    # Convert news to string for agent
+    news_text = "\n\n".join(f"{idx+1}. {n.title}\n{n.summary or ''}" for idx, n in enumerate(items))
+
+    # Run tagger agent
+    tagged_result = await Runner.run(tagger_agent, news_text)
+    raw_output = tagged_result.final_output if tagged_result else ""
+
+    if not raw_output:
+        print("No tags generated.")
+        return
+
+    # Convert agent output into structured objects
+    tagged_items = TaggedNewsItem.from_agent_text(raw_output)
+
+    # Update DB
+    await update_tags(items, tagged_items)
+
+    # Print nicely
+    for i, t in zip(items, tagged_items):
+        print(f"{i.title}\n  Symbols: {t.symbols}\n  Tags: {t.tags}\n")
+
+    print(f"✅ Tagged {len(items)} news items and saved to DB.")
+
+# === Wrapper for external calls ===
+async def run_tagger(items=None):
+    if not items:
+        items = await fetch_untagged_news(max_items=10)
+    if not items:
+        print("No untagged news to process.")
+        return []
+
+    news_text = "\n\n".join(f"{idx+1}. {n.title}\n{n.summary or ''}" for idx, n in enumerate(items))
+    tagged_result = await Runner.run(tagger_agent, news_text)
+    raw_output = tagged_result.final_output if tagged_result else ""
+    tagged_items = TaggedNewsItem.from_agent_text(raw_output)
+
+    if tagged_items:
+        await update_tags(items, tagged_items)
+        for i, t in zip(items, tagged_items):
+            print(f"{i.title}\n  Symbols: {t.symbols}\n  Tags: {t.tags}\n")
+        print(f"✅ Tagged {len(items)} news items and saved to DB.")
+
+    return tagged_items
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-# === Wrapper for pipeline integration ===
-async def run_tagger(items: List[NewsItem]) -> List[dict]:
-    async with async_session() as session:
-        tagged_items = await tag_news_items_and_update_db(items, session)
-        await session.commit()
-        return tagged_items
